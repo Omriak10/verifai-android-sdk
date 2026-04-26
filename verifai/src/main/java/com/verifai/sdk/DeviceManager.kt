@@ -1,66 +1,53 @@
 package com.verifai.sdk
 
-import com.google.firebase.firestore.FieldValue
-import com.google.firebase.firestore.FirebaseFirestore
-import com.google.firebase.firestore.SetOptions
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.security.MessageDigest
 
 /**
- * Internal device manager - handles registration and verification flow
+ * Internal device manager - handles registration and verification flow.
+ * All operations go through the REST API (ApiClient) — no direct Firestore access.
  */
 internal object DeviceManager {
     
     private const val CLOUD_PROJECT_NUMBER = 71845524469L
-    private const val DATABASE_NAME = "zkbank"
-    
-    private val db: FirebaseFirestore by lazy {
-        FirebaseFirestore.getInstance(DATABASE_NAME)
-    }
     
     /**
-     * Register device - stores signal hashes in Firebase
+     * Register device - collects signal hashes and sends to API
      */
     suspend fun register(config: VerifAI.Config, userId: String): VerifAI.RegistrationResult = withContext(Dispatchers.IO) {
         try {
-            val emailKey = userId.toEmailKey()
-            
-            // Collect all signal hashes
             val signalHashes = SignalCollector.collectSignalHashes(CLOUD_PROJECT_NUMBER)
             val deviceIdHash = SignalCollector.getDeviceIdHash()
-            val masterHash = computeMasterHash(signalHashes, deviceIdHash)
             
-            // Store in Firebase
-            val certData = hashMapOf(
-                "email" to userId,
-                "masterHash" to masterHash,
-                "deviceIdHash" to deviceIdHash.take(16),
-                "hashes" to signalHashes,
-                "loginCount" to 1,
-                "firstLogin" to System.currentTimeMillis(),
-                "lastLogin" to System.currentTimeMillis(),
-                "createdAt" to FieldValue.serverTimestamp()
-            )
+            val body = JSONObject().apply {
+                put("userId", userId)
+                put("deviceIdHash", deviceIdHash)
+                put("signalHashes", JSONObject(signalHashes))
+                put("deviceModel", android.os.Build.MODEL)
+                put("deviceBrand", android.os.Build.BRAND)
+            }
             
-            db.collection("zk_certificates")
-                .document(emailKey)
-                .set(certData)
-                .await()
+            val response = ApiClient.post(config, "/registerDevice", body)
+            val success = response.optBoolean("success", false)
+            val deviceId = response.optString("deviceId", deviceIdHash.take(16))
             
-            // Store locally
-            val prefs = config.context.getSharedPreferences("verifai_device", android.content.Context.MODE_PRIVATE)
-            prefs.edit()
-                .putString("certificate", masterHash)
-                .putString("device_id", deviceIdHash.take(16))
-                .putInt("login_count", 1)
-                .putLong("first_login", System.currentTimeMillis())
-                .apply()
+            if (success) {
+                // Store locally
+                val prefs = config.context.getSharedPreferences("verifai_device", android.content.Context.MODE_PRIVATE)
+                prefs.edit()
+                    .putString("certificate", response.optString("masterHash", ""))
+                    .putString("device_id", deviceId)
+                    .putInt("login_count", 1)
+                    .putLong("first_login", System.currentTimeMillis())
+                    .apply()
+            }
             
             VerifAI.RegistrationResult(
-                success = true,
-                deviceId = deviceIdHash.take(16)
+                success = success,
+                deviceId = deviceId,
+                error = if (!success) response.optString("error", "Registration failed") else null
             )
             
         } catch (e: Exception) {
@@ -72,147 +59,60 @@ internal object DeviceManager {
     }
     
     /**
-     * Verify device - compares current signals against stored profile
+     * Verify device - sends signal hashes to API for comparison
      */
     suspend fun verify(config: VerifAI.Config, userId: String): VerifAI.VerificationResult = withContext(Dispatchers.IO) {
         try {
-            val emailKey = userId.toEmailKey()
+            val signalHashes = SignalCollector.collectSignalHashes(CLOUD_PROJECT_NUMBER)
             val deviceIdHash = SignalCollector.getDeviceIdHash()
-            
-            // Check for existing certificate
-            val zkDoc = db.collection("zk_certificates").document(emailKey).get().await()
-            
-            if (!zkDoc.exists()) {
-                // No baseline - this is first login, register
-                val registerResult = register(config, userId)
-                return@withContext if (registerResult.success) {
-                    VerifAI.VerificationResult(
-                        status = VerifAI.Status.TRUSTED,
-                        trustScore = 50,
-                        trustLevel = VerifAI.TrustLevel.BASELINE,
-                        deviceId = registerResult.deviceId
-                    )
-                } else {
-                    VerifAI.VerificationResult(
-                        status = VerifAI.Status.ERROR,
-                        error = registerResult.error
-                    )
-                }
-            }
-            
-            // Get stored hashes
-            val storedDeviceId = zkDoc.getString("deviceIdHash") ?: ""
-            val storedHashes = zkDoc.get("hashes") as? Map<String, String> ?: emptyMap()
-            val loginCount = zkDoc.getLong("loginCount")?.toInt() ?: 0
-            val firstLogin = zkDoc.getLong("firstLogin") ?: System.currentTimeMillis()
-            
-            // Check if same device
-            if (deviceIdHash.take(16) == storedDeviceId) {
-                // Same device - update login count and verify
-                val currentHashes = SignalCollector.collectSignalHashes(CLOUD_PROJECT_NUMBER)
-                val matchScore = compareHashes(storedHashes, currentHashes)
-                
-                if (matchScore >= 60) {
-                    // Trusted - update login count
-                    val newLoginCount = loginCount + 1
-                    db.collection("zk_certificates").document(emailKey).update(
-                        mapOf(
-                            "loginCount" to newLoginCount,
-                            "lastLogin" to System.currentTimeMillis()
-                        )
-                    ).await()
-                    
-                    val trustLevel = when {
-                        newLoginCount >= 10 -> VerifAI.TrustLevel.VERY_HIGH
-                        newLoginCount >= 5 -> VerifAI.TrustLevel.HIGH
-                        newLoginCount >= 2 -> VerifAI.TrustLevel.MEDIUM
-                        else -> VerifAI.TrustLevel.BASELINE
-                    }
-                    
-                    val trustScore = when (trustLevel) {
-                        VerifAI.TrustLevel.VERY_HIGH -> 95
-                        VerifAI.TrustLevel.HIGH -> 85
-                        VerifAI.TrustLevel.MEDIUM -> 70
-                        VerifAI.TrustLevel.BASELINE -> 50
-                    }
-                    
-                    return@withContext VerifAI.VerificationResult(
-                        status = VerifAI.Status.TRUSTED,
-                        trustScore = trustScore,
-                        trustLevel = trustLevel,
-                        deviceId = storedDeviceId
-                    )
-                } else {
-                    // Signals don't match - suspicious
-                    return@withContext VerifAI.VerificationResult(
-                        status = VerifAI.Status.REJECTED,
-                        error = "Device signals have changed significantly"
-                    )
-                }
-            }
-            
-            // Different device - check if it's already approved as secondary
-            val secondaryDoc = db.collection("android_certificates")
-                .document("${emailKey}_${deviceIdHash.take(16)}")
-                .get()
-                .await()
-            
-            if (secondaryDoc.exists()) {
-                // Already approved secondary device
-                val secLoginCount = secondaryDoc.getLong("loginCount")?.toInt() ?: 0
-                val newLoginCount = secLoginCount + 1
-                
-                db.collection("android_certificates")
-                    .document("${emailKey}_${deviceIdHash.take(16)}")
-                    .update("loginCount", newLoginCount, "lastLogin", System.currentTimeMillis())
-                    .await()
-                
-                val trustLevel = when {
-                    newLoginCount >= 10 -> VerifAI.TrustLevel.VERY_HIGH
-                    newLoginCount >= 5 -> VerifAI.TrustLevel.HIGH
-                    newLoginCount >= 2 -> VerifAI.TrustLevel.MEDIUM
-                    else -> VerifAI.TrustLevel.BASELINE
-                }
-                
-                return@withContext VerifAI.VerificationResult(
-                    status = VerifAI.Status.TRUSTED,
-                    trustScore = when (trustLevel) {
-                        VerifAI.TrustLevel.VERY_HIGH -> 95
-                        VerifAI.TrustLevel.HIGH -> 85
-                        VerifAI.TrustLevel.MEDIUM -> 70
-                        VerifAI.TrustLevel.BASELINE -> 50
-                    },
-                    trustLevel = trustLevel,
-                    deviceId = deviceIdHash.take(16)
-                )
-            }
-            
-            // New device - needs approval
-            val sessionId = java.util.UUID.randomUUID().toString().take(8)
             val publicIP = NetworkUtils.getPublicIP()
-            val currentHashes = SignalCollector.collectSignalHashes(CLOUD_PROJECT_NUMBER)
             
-            val approvalData = hashMapOf(
-                "email" to userId,
-                "sessionId" to sessionId,
-                "deviceModel" to android.os.Build.MODEL,
-                "deviceBrand" to android.os.Build.BRAND,
-                "publicIP" to publicIP,
-                "status" to "pending",
-                "requestedAt" to System.currentTimeMillis(),
-                "currentHashes" to currentHashes,
-                "deviceIdHash" to deviceIdHash.take(16)
-            )
+            val body = JSONObject().apply {
+                put("userId", userId)
+                put("deviceIdHash", deviceIdHash)
+                put("signalHashes", JSONObject(signalHashes))
+                put("publicIP", publicIP)
+                put("deviceModel", android.os.Build.MODEL)
+                put("deviceBrand", android.os.Build.BRAND)
+            }
             
-            db.collection("android_approval_requests")
-                .document(sessionId)
-                .set(approvalData)
-                .await()
+            val response = ApiClient.post(config, "/verifyDevice", body)
+            val status = response.optString("status", "ERROR")
+            
+            val verifaiStatus = when (status) {
+                "TRUSTED" -> VerifAI.Status.TRUSTED
+                "NEW_DEVICE" -> VerifAI.Status.NEW_DEVICE
+                "PENDING" -> VerifAI.Status.PENDING
+                "REJECTED" -> VerifAI.Status.REJECTED
+                else -> VerifAI.Status.ERROR
+            }
+            
+            val trustLevelStr = response.optString("trustLevel", "BASELINE")
+            val trustLevel = when (trustLevelStr) {
+                "VERY_HIGH" -> VerifAI.TrustLevel.VERY_HIGH
+                "HIGH" -> VerifAI.TrustLevel.HIGH
+                "MEDIUM" -> VerifAI.TrustLevel.MEDIUM
+                else -> VerifAI.TrustLevel.BASELINE
+            }
+            
+            // Update local storage on trusted
+            if (verifaiStatus == VerifAI.Status.TRUSTED) {
+                val prefs = config.context.getSharedPreferences("verifai_device", android.content.Context.MODE_PRIVATE)
+                val count = prefs.getInt("login_count", 0) + 1
+                prefs.edit()
+                    .putString("device_id", response.optString("deviceId", deviceIdHash.take(16)))
+                    .putInt("login_count", count)
+                    .putLong("last_login", System.currentTimeMillis())
+                    .apply()
+            }
             
             VerifAI.VerificationResult(
-                status = VerifAI.Status.NEW_DEVICE,
-                sessionId = sessionId,
-                deviceId = deviceIdHash.take(16)
+                status = verifaiStatus,
+                trustScore = response.optInt("trustScore", 0),
+                trustLevel = trustLevel,
+                deviceId = response.optString("deviceId", deviceIdHash.take(16)),
+                sessionId = response.optString("sessionId", null),
+                error = response.optString("error", null)
             )
             
         } catch (e: Exception) {
@@ -224,103 +124,30 @@ internal object DeviceManager {
     }
     
     /**
-     * Get trust score for current device
+     * Get trust score - now via REST API
      */
     suspend fun getTrustScore(config: VerifAI.Config, userId: String): VerifAI.TrustScore = withContext(Dispatchers.IO) {
         try {
-            val emailKey = userId.toEmailKey()
             val deviceIdHash = SignalCollector.getDeviceIdHash().take(16)
+            val response = ApiClient.get(config, "/getTrustScore?userId=${userId.encodeUrl()}&deviceId=${deviceIdHash.encodeUrl()}&type=android")
             
-            // Check primary certificate
-            val zkDoc = db.collection("zk_certificates").document(emailKey).get().await()
-            if (zkDoc.exists() && zkDoc.getString("deviceIdHash") == deviceIdHash) {
-                val loginCount = zkDoc.getLong("loginCount")?.toInt() ?: 0
-                val firstLogin = zkDoc.getLong("firstLogin") ?: System.currentTimeMillis()
-                val ageInDays = ((System.currentTimeMillis() - firstLogin) / (1000 * 60 * 60 * 24)).toInt()
-                
-                val level = when {
-                    loginCount >= 10 -> VerifAI.TrustLevel.VERY_HIGH
-                    loginCount >= 5 -> VerifAI.TrustLevel.HIGH
-                    loginCount >= 2 -> VerifAI.TrustLevel.MEDIUM
-                    else -> VerifAI.TrustLevel.BASELINE
-                }
-                
-                var score = when (level) {
-                    VerifAI.TrustLevel.VERY_HIGH -> 95
-                    VerifAI.TrustLevel.HIGH -> 85
-                    VerifAI.TrustLevel.MEDIUM -> 70
-                    VerifAI.TrustLevel.BASELINE -> 50
-                }
-                
-                if (ageInDays > 30) score = minOf(100, score + 5)
-                
-                return@withContext VerifAI.TrustScore(level, score, loginCount, ageInDays)
+            val level = when (response.optString("level", response.optString("trustLevel", "BASELINE"))) {
+                "VERY_HIGH", "very_high" -> VerifAI.TrustLevel.VERY_HIGH
+                "HIGH", "high" -> VerifAI.TrustLevel.HIGH
+                "MEDIUM", "medium" -> VerifAI.TrustLevel.MEDIUM
+                else -> VerifAI.TrustLevel.BASELINE
             }
             
-            // Check secondary certificate
-            val secDoc = db.collection("android_certificates")
-                .document("${emailKey}_$deviceIdHash")
-                .get()
-                .await()
-            
-            if (secDoc.exists()) {
-                val loginCount = secDoc.getLong("loginCount")?.toInt() ?: 0
-                val firstLogin = secDoc.getLong("firstLogin") ?: System.currentTimeMillis()
-                val ageInDays = ((System.currentTimeMillis() - firstLogin) / (1000 * 60 * 60 * 24)).toInt()
-                
-                val level = when {
-                    loginCount >= 10 -> VerifAI.TrustLevel.VERY_HIGH
-                    loginCount >= 5 -> VerifAI.TrustLevel.HIGH
-                    loginCount >= 2 -> VerifAI.TrustLevel.MEDIUM
-                    else -> VerifAI.TrustLevel.BASELINE
-                }
-                
-                var score = when (level) {
-                    VerifAI.TrustLevel.VERY_HIGH -> 95
-                    VerifAI.TrustLevel.HIGH -> 85
-                    VerifAI.TrustLevel.MEDIUM -> 70
-                    VerifAI.TrustLevel.BASELINE -> 50
-                }
-                
-                if (ageInDays > 30) score = minOf(100, score + 5)
-                
-                return@withContext VerifAI.TrustScore(level, score, loginCount, ageInDays)
-            }
-            
-            // Not registered
-            VerifAI.TrustScore(VerifAI.TrustLevel.BASELINE, 0, 0, 0)
-            
+            VerifAI.TrustScore(
+                level = level,
+                score = response.optInt("score", response.optInt("trustScore", 0)),
+                loginCount = response.optInt("loginCount", 0),
+                ageInDays = response.optInt("ageInDays", 0)
+            )
         } catch (e: Exception) {
             VerifAI.TrustScore(VerifAI.TrustLevel.BASELINE, 0, 0, 0)
         }
     }
     
-    // ==================== Helpers ====================
-    
-    private fun String.toEmailKey(): String {
-        return this.lowercase().replace(".", "_").replace("@", "_at_")
-    }
-    
-    private fun computeMasterHash(hashes: Map<String, String>, deviceId: String): String {
-        val combined = hashes.values.sorted().joinToString("|") + "|" + deviceId
-        val bytes = MessageDigest.getInstance("SHA-256").digest(combined.toByteArray())
-        return bytes.joinToString("") { "%02x".format(it) }
-    }
-    
-    private fun compareHashes(stored: Map<String, String>, current: Map<String, String>): Int {
-        var matchCount = 0
-        var totalCount = 0
-        
-        for ((key, storedValue) in stored) {
-            val currentValue = current[key]
-            if (currentValue != null) {
-                totalCount++
-                if (storedValue == currentValue) {
-                    matchCount++
-                }
-            }
-        }
-        
-        return if (totalCount == 0) 0 else (matchCount * 100) / totalCount
-    }
+    private fun String.encodeUrl(): String = java.net.URLEncoder.encode(this, "UTF-8")
 }

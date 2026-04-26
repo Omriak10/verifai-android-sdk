@@ -120,7 +120,7 @@ internal object ApiClient {
     
     // ==================== HTTP Helpers ====================
     
-    private fun get(config: VerifAI.Config, endpoint: String): JSONObject {
+    internal fun get(config: VerifAI.Config, endpoint: String): JSONObject {
         val url = URL("$BASE_URL$endpoint")
         val conn = url.openConnection() as HttpURLConnection
         
@@ -134,7 +134,7 @@ internal object ApiClient {
         return JSONObject(response)
     }
     
-    private fun post(config: VerifAI.Config, endpoint: String, body: JSONObject): JSONObject {
+    internal fun post(config: VerifAI.Config, endpoint: String, body: JSONObject): JSONObject {
         val url = URL("$BASE_URL$endpoint")
         val conn = url.openConnection() as HttpURLConnection
         
@@ -151,7 +151,7 @@ internal object ApiClient {
         return JSONObject(response)
     }
     
-    private fun delete(config: VerifAI.Config, endpoint: String): JSONObject {
+    internal fun delete(config: VerifAI.Config, endpoint: String): JSONObject {
         val url = URL("$BASE_URL$endpoint")
         val conn = url.openConnection() as HttpURLConnection
         
