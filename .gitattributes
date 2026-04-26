@@ -1,0 +1,11 @@
+# Ensure binary files are never modified by Git line-ending conversion
+*.jar binary
+*.aar binary
+*.png binary
+*.jpg binary
+*.zip binary
+*.gz binary
+*.so binary
+
+# Gradlew script must keep LF line endings
+gradlew text eol=lf
